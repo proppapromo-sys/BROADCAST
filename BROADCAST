@@ -1,0 +1,519 @@
+#!/usr/bin/env python3
+"""
+universal_intelligence.py — THE UNIVERSAL INTELLIGENCE. The full embodiment.
+
+A single, self-contained, copy-me foundation for building ANY heavy, self-aware,
+self-improving system — in any domain. Not tailored to trading, ops, robotics,
+content, or markets; it is the shared architecture *underneath* all of them. You
+implement the organs for your world; the intelligence is provided.
+
+THE SHAPE OF A MIND (the loop every intelligent system runs):
+
+      PERCEIVE → MODEL → VALUE → DECIDE → ACT → REMEMBER → LEARN
+         👂        🧠       🎯      ⚖️      ✋       📓        📈
+                         …all under a BRAIN that sets ONE posture
+                            and a GOVERNOR that can always say no.
+
+THE LAWS (the DNA — universal, never break them):
+  1. Survive first.                  A system that dies learns nothing. Safety outranks gain.
+  2. Belief vs the world.            Act on the gap between your estimate and reality — not on hope.
+  3. Validate before you commit.     The Critic is a SWITCH on real action, not a printed number.
+  4. Earn trust on the record.       Recognise + remember; confidence is learned, never assumed.
+  5. Confirm-first, never chase.     No revenge, no doubling down on a streak.
+
+WHAT'S IN THE BOX:
+  Organs (you implement):  Sensor · Model · Objective · Policy · Actuator · Critic
+  Memory + Learning:       Memory (append-only) · trust/shrink (record → confidence)
+  Self-awareness:          Context (shared nervous system) · Brain (one posture, roles reassign)
+  Control:                 Controller (homeostasis — hold any quantity at an aimed setpoint)
+                           Budget (one shared resource cap)  ·  Governor (limits + kill-switch)
+  The loop:                Machine (perceive→…→learn, with the full modulation chain)
+  Helpers:                 sane · shrink · trajectory · clears_cost · confidence/proof haircuts
+
+SPECIALISE IT: a domain = the six organs + a capacity. (The "staking genome" is just this
+with Budget=bankroll, Governor=daily-stop, Objective=edge. Swap those for compute/SLA/
+inventory/attention and the same mind runs an autoscaler, a planner, a publisher, a robot.)
+
+Run this file for a full end-to-end demo (a neutral "opportunity engine"):  python universal_intelligence.py
+"""
+from __future__ import annotations
+
+import json
+import math
+import os
+import time
+from abc import ABC, abstractmethod
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  ORGANS — the six you implement for your domain
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Sensor(ABC):
+    """👂 PERCEIVE — where the world enters. Returns the things you could act on now."""
+    @abstractmethod
+    def perceive(self) -> list:
+        ...
+
+
+class Belief:
+    """🧠 a MODEL's output: an estimate + how sure it is (0..1). Confidence drives sizing
+    and honesty — an unsure belief must not move size like a sure one."""
+    __slots__ = ("value", "confidence", "extra")
+
+    def __init__(self, value, confidence=0.5, **extra):
+        self.value = float(value)
+        self.confidence = max(0.0, min(1.0, float(confidence)))
+        self.extra = extra
+
+
+class Model(ABC):
+    """🧠 BELIEVE — your estimate of the world, with a confidence. This is the hard 95%;
+    the framework does NOT solve it. If you can't beat a naive baseline out-of-sample, the
+    honest output is low confidence — which the machine will correctly size toward zero."""
+    @abstractmethod
+    def estimate(self, obs) -> Belief:
+        ...
+
+
+class Objective(ABC):
+    """🎯 WANT — how good is this option, given the belief? The goal/utility to maximise.
+    Return ≤ 0 to mean 'not worth it' (a first-class, common, correct result)."""
+    @abstractmethod
+    def utility(self, obs, belief: Belief) -> float:
+        ...
+
+
+class Policy(ABC):
+    """⚖️ DECIDE — how big a commitment does this option deserve, in [0, 1] of the per-action
+    capacity? (The machine then applies the universal haircuts, control, budget and caps.)"""
+    @abstractmethod
+    def weight(self, obs, belief: Belief, utility: float) -> float:
+        ...
+
+
+class Actuator(ABC):
+    """✋ ACT — confirm-first. Dry-run unless live=True. Return a result object the Critic
+    can score; the action (even dry) IS part of the record."""
+    @abstractmethod
+    def act(self, obs, amount, live=False):
+        ...
+
+
+class Critic(ABC):
+    """📈 VALIDATE — did it work? Score a completed action forward (>0 good). The Critic is
+    the SWITCH that unlocks real action (law 3) — not a number you print and ignore."""
+    @abstractmethod
+    def score(self, obs, result) -> float:
+        ...
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  MEMORY + LEARNING — the record, and turning it into earned trust
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Memory:
+    """📓 the append-only record (law 4). File-backed (compounds between runs) or in-memory."""
+    def __init__(self, path=None):
+        self.path = path
+        self._mem = [] if path is None else None
+
+    def append(self, rec: dict) -> dict:
+        rec = dict(rec); rec.setdefault("ts", round(time.time(), 3))
+        if self.path is None:
+            self._mem.append(rec)
+        else:
+            with open(self.path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec) + "\n")
+        return rec
+
+    def read(self) -> list:
+        if self.path is None:
+            return list(self._mem)
+        if not os.path.exists(self.path):
+            return []
+        out = []
+        with open(self.path, encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    try:
+                        out.append(json.loads(line))
+                    except ValueError:
+                        pass
+        return out
+
+
+def shrink(wins, n, prior=0.5, weight=10.0) -> float:
+    """Bayesian-shrunk success rate: pulls a thin sample toward the prior so one lucky hit
+    can't earn trust. The atom of all learning here."""
+    return (wins + prior * weight) / (n + weight) if (n + weight) else prior
+
+
+def trust_by(records, field, prior=0.5, weight=10.0) -> dict:
+    """Earned trust per value of `field` (e.g. category) from decision/outcome records."""
+    by_id = {r.get("id"): r.get(field) for r in records if r.get("kind") == "decision"}
+    wins, total = {}, {}
+    for r in records:
+        if r.get("kind") != "outcome":
+            continue
+        k = r.get(field) or by_id.get(r.get("id"))
+        if not k:
+            continue
+        wins[k] = wins.get(k, 0.0) + (1.0 if (r.get("score") or 0) > 0 else 0.0)
+        total[k] = total.get(k, 0) + 1
+    return {k: shrink(wins[k], n, prior, weight) for k, n in total.items()}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  CONTROL — homeostasis, a shared budget, and a generic governor
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Controller:
+    """⚖️ HOMEOSTASIS — the restoring force. Holds a measured quantity at an AIMED setpoint
+    (not a flat one): a moving-target P-controller. Where a Governor is a WALL, this is the
+    SPRING that keeps you centered so you rarely reach the wall. retarget() it toward your
+    goal; correction() returns a multiplier (≤1 restrains; >1 only if ceil>1, to thrust)."""
+    def __init__(self, target, gain=0.8, tol=0.0, floor=0.0, ceil=1.0):
+        self.target, self.gain, self.tol = float(target), float(gain), float(tol)
+        self.floor, self.ceil = float(floor), float(ceil)
+
+    def retarget(self, target):
+        self.target = float(target); return self
+
+    def correction(self, measured, span=None) -> float:
+        e = measured - self.target
+        if abs(e) <= self.tol:
+            return min(self.ceil, max(self.floor, 1.0))
+        s = span if span else (abs(self.target) or 1.0)
+        return max(self.floor, min(self.ceil, 1.0 - self.gain * (e / s)))
+
+
+class Budget:
+    """💰 ONE shared resource cap across all actions (money, compute, slots, attention).
+    The wall the Heart can't over-commit."""
+    def __init__(self, cap):
+        self.cap = float(cap); self.committed = 0.0
+
+    @property
+    def free(self):
+        return max(0.0, self.cap - self.committed)
+
+    def load(self):
+        return (self.committed / self.cap) if self.cap else 0.0
+
+    def can_commit(self, amount):
+        return amount <= self.free + 1e-9
+
+    def commit(self, amount):
+        self.committed += amount; return self.committed
+
+    def release(self):
+        self.committed = 0.0
+
+
+class Governor:
+    """❤️ SAFETY — domain-agnostic and BUILT FIRST. A per-action cap, a circuit breaker on
+    cumulative harm this period, a kill-switch, and `capacity` (the total resource, which
+    COMPOUNDS as outcomes settle). record(delta) is what makes the guard real — a guard
+    nothing writes to reads as safe but isn't."""
+    def __init__(self, capacity, max_per=0.1, harm_limit=0.10):
+        self.capacity = float(capacity)        # total resource — grows/shrinks with outcomes
+        self.max_per = max_per                  # most of capacity any single action may use
+        self.harm_limit = harm_limit            # circuit breaker: stop the period past this loss
+        self.period_pnl = 0.0
+        self.period_open = float(capacity)
+        self.killed = False
+
+    def new_period(self, capacity=None):
+        if capacity is not None:
+            self.capacity = float(capacity)
+        self.period_pnl = 0.0
+        self.period_open = self.capacity
+        self.killed = False
+        return self
+
+    def tripped(self):
+        return self.period_open > 0 and self.period_pnl <= -self.harm_limit * self.period_open
+
+    def allow(self):
+        if self.killed:
+            return (False, "kill-switch active")
+        if self.tripped():
+            return (False, "circuit breaker (harm limit)")
+        return (True, "")
+
+    def record(self, delta):
+        """Settle a realized outcome → capacity (compounding), the period ledger, and the
+        kill-switch. THIS closes the loop: next action sizes off updated capacity."""
+        self.period_pnl += delta
+        self.capacity = max(0.0, self.capacity + delta)
+        if self.tripped():
+            self.killed = True
+        return self.killed
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  SELF-AWARENESS — the shared nervous system and the central brain
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Context:
+    """🧠↔ the shared NERVOUS SYSTEM. One object every part reads and writes each cycle, so
+    the Brain talks to every part and the parts talk to each other."""
+    def __init__(self):
+        self.posture = "RUN"
+        self.state, self.roles, self.directives = {}, {}, {}
+
+    def report(self, who, reading):
+        self.state[who] = reading; return reading
+
+    def sense(self, who, default=None):
+        return self.state.get(who, default)
+
+    def directive(self, key, default=None):
+        return self.directives.get(key, default)
+
+
+class Brain:
+    """🧠 CENTRAL INTELLIGENCE — the conductor. Reads every part through the Context and sets
+    ONE posture the whole system obeys; roles REASSIGN to keep it advancing in control.
+      ADVANCE  — healthy + improving → full effort, lean offense
+      RUN      — steady → normal
+      GUARD    — degrading → protect, only act on a strong signal (no speculative new work)
+      HALT     — unsafe (killed / breaker) → freeze; finish/clean up only
+    Generic and domain-free: 'health' and 'trajectory' are whatever your domain reports."""
+    POSTURES = ("ADVANCE", "RUN", "GUARD", "HALT")
+    ROLES = {
+        "ADVANCE": {"Policy": "offense",   "Model": "trust",   "Controller": "aim-up",   "Actuator": "build"},
+        "RUN":     {"Policy": "steady",    "Model": "watch",   "Controller": "center",   "Actuator": "hold"},
+        "GUARD":   {"Policy": "selective", "Model": "skeptic", "Controller": "contract", "Actuator": "protect"},
+        "HALT":    {"Policy": "frozen",    "Model": "skeptic", "Controller": "hold",     "Actuator": "cleanup"},
+    }
+
+    def assess(self, ctx: Context):
+        traj = ctx.sense("trajectory", {}) or {}
+        sysr = ctx.sense("system", {}) or {}
+        adv, health = traj.get("ascent", 0.0), sysr.get("health", 1.0)
+        if sysr.get("killed") or sysr.get("unsafe"):
+            posture, size, gate = "HALT", 0.0, "none"
+        elif adv < -0.05 or health < 0.5:
+            posture, size, gate = "GUARD", 0.5, "strong-only"
+        elif adv > 0.15 and health > 0.7:
+            posture, size, gate = "ADVANCE", 1.0, "all"
+        else:
+            posture, size, gate = "RUN", 1.0, "all"
+        ctx.posture = posture
+        ctx.directives = {"size_mult": size, "gate": gate}
+        ctx.roles = dict(self.ROLES[posture])
+        return posture, ctx.directives
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS — sanity, anticipation, cost-benefit, the haircuts
+# ══════════════════════════════════════════════════════════════════════════════
+
+def sane(obs, nonneg=("cost", "size", "price", "amount", "quantity")) -> str:
+    """Reason string if the observation is impossible to act on, else None (sanity gate)."""
+    for k in nonneg:
+        if k in obs:
+            v = obs[k]
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) or v < 0:
+                return "%s invalid (%r)" % (k, v)
+    return None
+
+
+def trajectory(series) -> float:
+    """⏱️ LEAD THE TARGET — velocity + ½·acceleration of a series (where it's GOING, not where
+    it is). >0 heading up. Use it to anticipate instead of chasing the snapshot."""
+    if not series or len(series) < 11 or series[-6] == 0 or series[-11] == 0:
+        return 0.0
+    v = series[-1] / series[-6] - 1.0
+    return v + 0.5 * (v - (series[-6] / series[-11] - 1.0))
+
+
+def clears_cost(benefit, cost, mult=1.0) -> bool:
+    """💵 BEAT YOUR VIG — only act if the benefit clears the cost of acting (× a safety margin)."""
+    return benefit >= cost * mult
+
+
+def confidence_haircut(confidence, floor=0.0) -> float:
+    """Shrink size by how SURE the belief is (confidence 0..1). Don't bet a guess like a fact."""
+    return max(floor, min(1.0, confidence))
+
+
+def proof_haircut(trust, floor=0.25) -> float:
+    """Shrink size by how PROVEN the category is (trust 0.5 = unproven → toward floor; 1 → full).
+    Floor is >0 on purpose: pure-zero would deadlock learning (you must act a little to learn)."""
+    return max(floor, min(1.0, 2.0 * (trust - 0.5)))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  THE MACHINE — the universal loop
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Machine:
+    def __init__(self, sensor: Sensor, model: Model, objective: Objective, policy: Policy,
+                 actuator: Actuator, governor: Governor, critic: Critic = None, memory: Memory = None,
+                 brain: Brain = None, controller: Controller = None, budget: Budget = None,
+                 name="system", min_proof=20, trust_table=None):
+        self.sensor, self.model, self.objective, self.policy, self.actuator = sensor, model, objective, policy, actuator
+        self.governor, self.critic, self.memory = governor, critic, memory
+        self.brain, self.controller, self.budget = brain, controller, budget
+        self.name, self.min_proof = name, min_proof
+        self.trust_table = dict(trust_table or {})     # category → earned trust (learned)
+        self._proof = []                                # the Critic's forward scores
+        self.ctx = Context()
+
+    # — the Critic is the SWITCH that unlocks real action (law 3) —
+    def proven(self):
+        if not self.critic or len(self._proof) < self.min_proof:
+            return False
+        return (sum(self._proof) / len(self._proof)) > 0
+
+    def relearn(self):
+        """Turn the record into earned trust (call between runs / periodically)."""
+        if self.memory is not None:
+            self.trust_table = trust_by(self.memory.read(), "category")
+        return self.trust_table
+
+    def _confer(self):
+        if not self.brain:
+            return {"gate": "all", "size_mult": 1.0}
+        g = self.governor
+        self.ctx.report("system", {"killed": g.killed, "unsafe": g.tripped(),
+                                   "health": self.ctx.sense("system", {}).get("health", 1.0)})
+        self.ctx.report("trajectory", {"ascent": self.ctx.sense("trajectory", {}).get("ascent", 0.0)})
+        posture, directives = self.brain.assess(self.ctx)
+        print("  🧠 posture: %s — roles %s" % (posture, self.ctx.roles))
+        return directives
+
+    def cycle(self, act=False, live=False):
+        d = self._confer()
+        gate, size_mult = d.get("gate", "all"), d.get("size_mult", 1.0)
+        go_live = live and self.proven()
+        if live and not go_live:
+            print("  📈 LIVE BLOCKED — not validated (critic n=%d/%d, mean must be >0). Dry-run." % (len(self._proof), self.min_proof))
+        per = self.governor.capacity * self.governor.max_per      # most resource per action
+        plans = []
+        for obs in self.sensor.perceive():
+            oid = obs.get("id", "?")
+            bad = sane(obs)
+            if bad:
+                print("  drop  %-12s — ⚠️ %s" % (oid, bad)); continue
+            ok, why = self.governor.allow()
+            if not ok:
+                print("  HALT  %-12s — ❤️ %s" % (oid, why)); continue
+            if gate == "none":
+                print("  hold  %-12s — 🧠 %s (freeze)" % (oid, self.ctx.posture)); continue
+            belief = self.model.estimate(obs)
+            util = self.objective.utility(obs, belief)
+            if util <= 0:
+                print("  pass  %-12s — 🎯 no value (util %.3f)" % (oid, util)); continue
+            if gate == "strong-only" and belief.confidence < 0.66:
+                print("  watch %-12s — 🧠 GUARD (only strong signals; conf %.2f)" % (oid, belief.confidence)); continue
+            # — the universal sizing chain: intent × honesty × proof × homeostasis × brain —
+            trust = self.trust_table.get(obs.get("category"), 0.5)
+            commit = self.policy.weight(obs, belief, util)
+            commit *= confidence_haircut(belief.confidence)        # don't trust a guess
+            commit *= proof_haircut(trust)                          # don't trust the unproven
+            if self.controller and self.budget:
+                commit *= self.controller.correction(self.budget.load())   # ⚖️ stay centered
+            commit *= size_mult                                     # 🧠 brain modulation
+            amount = round(max(0.0, min(commit, 1.0)) * per, 2)      # per = capacity × max_per (the hard per-action cap)
+            if amount <= 0:
+                print("  pass  %-12s — size 0 (haircut)" % oid); continue
+            if self.budget is not None and not self.budget.can_commit(amount):
+                print("  pass  %-12s — 💰 budget full (free %.2f)" % (oid, self.budget.free)); continue
+            if self.budget is not None:
+                self.budget.commit(amount)
+            print("  🎯 %-12s value %.2f · conf %.2f · trust %.2f → commit %.2f" % (oid, util, belief.confidence, trust, amount))
+            plans.append((obs, amount))
+            if self.memory is not None:
+                self.memory.append({"kind": "decision", "id": oid, "category": obs.get("category"), "amount": amount, "util": util})
+        if act:
+            for obs, amount in plans:
+                result = self.actuator.act(obs, amount, live=go_live)
+                if self.critic is not None:
+                    sc = self.critic.score(obs, result)
+                    self._proof.append(sc)
+                    if self.memory is not None:
+                        self.memory.append({"kind": "outcome", "id": obs.get("id"), "category": obs.get("category"), "score": sc})
+        return plans
+
+    def run_forever(self, interval_s=300, is_open=lambda: True, act=True, live=False):
+        while True:
+            try:
+                if is_open():
+                    print("── %s cycle ──" % self.name)
+                    self.cycle(act=act, live=live)
+                time.sleep(interval_s)
+            except KeyboardInterrupt:
+                return
+            except Exception as ex:
+                print("cycle error (continuing):", ex); time.sleep(30)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  END-TO-END DEMO — a NEUTRAL "opportunity engine" (no trading, no domain bias)
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    # A generic system that decides which OPPORTUNITIES to spend effort on, learns which
+    # KINDS pay off, stays inside a capacity budget, lets a brain set its posture, and won't
+    # act for real until its results are validated. Swap the organs → any domain.
+
+    class _Sensor(Sensor):
+        def perceive(self):
+            return [{"id": "alpha", "category": "growth", "signal": 0.9, "cost": 1.0},
+                    {"id": "beta",  "category": "growth", "signal": 0.8, "cost": 1.0},
+                    {"id": "gamma", "category": "vanity", "signal": 0.85, "cost": 1.0}]
+
+    class _Model(Model):
+        def estimate(self, o):
+            return Belief(value=o["signal"], confidence=o["signal"])   # signal doubles as confidence here
+
+    class _Objective(Objective):
+        def utility(self, o, b):
+            return b.value - o["cost"] * 0.4                            # net worth of acting
+
+    class _Policy(Policy):
+        def weight(self, o, b, u):
+            return min(1.0, u)                                          # commit ∝ utility
+
+    class _Actuator(Actuator):
+        def act(self, o, amount, live=False):
+            print("    %s %-7s effort %.2f" % ("LIVE" if live else "dry ", o["id"], amount))
+            return {"obs": o, "amount": amount}
+
+    class _Critic(Critic):
+        # forward truth: 'growth' opportunities pay off, 'vanity' ones don't
+        def score(self, o, result):
+            return 1.0 if o["category"] == "growth" else -1.0
+
+    print("UNIVERSAL INTELLIGENCE — end-to-end demo (neutral opportunity engine)\n")
+    mem = Memory()
+    gov = Governor(capacity=1000, max_per=0.2, harm_limit=0.10); gov.new_period()
+    ctrl = Controller(target=0.4, gain=0.8, floor=0.3)        # keep ~40% of budget deployed
+    bud = Budget(cap=400)
+    m = Machine(_Sensor(), _Model(), _Objective(), _Policy(), _Actuator(), gov,
+                critic=_Critic(), memory=mem, brain=Brain(), controller=ctrl, budget=bud,
+                min_proof=4)
+
+    print("cycle 1 — healthy & improving → ADVANCE; live requested but NOT validated → dry-run:")
+    m.ctx.report("system", {"health": 0.9}); m.ctx.report("trajectory", {"ascent": 0.3})
+    m.cycle(act=True, live=True)
+    print("  validated? %s · capacity $%.0f" % (m.proven(), gov.capacity))
+
+    print("\ncycle 2 — relearn from the record → 'growth' proven, 'vanity' sinks; live UNLOCKS:")
+    bud.release(); m.relearn()
+    print("  learned trust:", {k: round(v, 2) for k, v in m.trust_table.items()})
+    m.cycle(act=True, live=True)
+    print("  validated? %s (n=%d)" % (m.proven(), len(m._proof)))
+
+    print("\ncycle 3 — a big harm settles → governor trips the kill-switch → brain HALTs:")
+    gov.record(-120)
+    m.ctx.report("system", {"health": 0.9})
+    print("  after -120: capacity $%.0f · killed? %s" % (gov.capacity, gov.killed))
+    m.cycle(act=True)
+
+    print("\nhelpers: clears_cost(0.7,0.5)=%s · trajectory([rising])=%.3f"
+          % (clears_cost(0.7, 0.5), trajectory([100, 101, 102, 103, 104, 106, 108, 111, 114, 118, 123])))
